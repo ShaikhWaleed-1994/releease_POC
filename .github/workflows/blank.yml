@@ -1,0 +1,110 @@
+name: Guard Cascade Order (Reusable)
+
+
+on:
+  workflow_call:
+    inputs:
+      final_branch:
+        description: "Branch the tip of a family is allowed to target"
+        required: false
+        default: "master"
+        type: string
+      override_label:
+        description: >-
+          PR label that bypasses this guard, for genuine emergencies. Set to an
+          empty string to remove the escape hatch entirely.
+        required: false
+        default: "cascade-override"
+        type: string
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the PR targets the next branch in the cascade
+        env:
+          SRC: ${{ github.event.pull_request.head.ref }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          FINAL_BRANCH: ${{ inputs.final_branch }}
+          OVERRIDE_LABEL: ${{ inputs.override_label }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # --- KEEP IN SYNC with the identical parse() in promote-reusable.yml ---
+          # Splits "<front-ending-in-non-digit><trailing-number>" and strips the
+          # 3-part version so branches differing only by version share a family.
+          parse() {  # $1 = branch name; sets PARSE_STEM and PARSE_NUM, returns 1 if not a release branch
+            local b="$1" front
+            [[ "$b" =~ ^(.*[^0-9])([0-9]+)$ ]] || return 1
+            front="${BASH_REMATCH[1]}"
+            PARSE_NUM=$(( 10#${BASH_REMATCH[2]} ))
+            [[ "$front" =~ ^(release_)[0-9]+\.[0-9]+\.[0-9]+(.*)$ ]] || return 1
+            PARSE_STEM="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+            return 0
+          }
+
+          fail() {  # $1 = one-line reason, $2 = guidance paragraph
+            echo "::error title=Cascade order violation::$1"
+            {
+              echo "### Cascade order violation"
+              echo
+              echo "**\`$SRC\` → \`$BASE\` is not allowed.**"
+              echo
+              echo "$2"
+              echo
+              if [[ -n "$OVERRIDE_LABEL" ]]; then
+                echo "If this is a genuine emergency, add the \`$OVERRIDE_LABEL\` label to bypass this check."
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          if [[ -n "$OVERRIDE_LABEL" ]] && jq -e --arg l "$OVERRIDE_LABEL" 'any(.[]; . == $l)' <<<"$LABELS" >/dev/null; then
+            echo "PR carries the '$OVERRIDE_LABEL' label — guard bypassed."
+            exit 0
+          fi
+
+          if ! parse "$SRC"; then
+            echo "Head branch '$SRC' is not a numbered release branch — guard does not apply."
+            exit 0
+          fi
+          src_stem="$PARSE_STEM"
+          want_num=$(( PARSE_NUM + 1 ))
+          echo "Head '$SRC' -> family '$src_stem', number $PARSE_NUM. The only legal target is number $want_num in this family, else '$FINAL_BRANCH'."
+
+          # Discover the existing branch in the same family numbered current+1.
+          expected=""
+          while read -r _sha ref; do
+            b="${ref#refs/heads/}"
+            if parse "$b" && [[ "$PARSE_STEM" == "$src_stem" && "$PARSE_NUM" -eq "$want_num" ]]; then
+              expected="$b"
+              break
+            fi
+          done < <(git ls-remote --heads origin 'release_*')
+
+          if [[ -z "$expected" ]]; then
+            expected="$FINAL_BRANCH"
+            echo "No branch numbered $want_num in family '$src_stem' — '$SRC' is the tip, so '$FINAL_BRANCH' is the legal target."
+          fi
+
+          if [[ "$BASE" == "$expected" ]]; then
+            echo "OK: '$SRC' -> '$BASE' is the correct next hop in the cascade."
+            exit 0
+          fi
+
+          if [[ "$expected" == "$FINAL_BRANCH" ]]; then
+            fail \
+              "'$SRC' must target '$FINAL_BRANCH', not '$BASE'." \
+              "\`$SRC\` is the highest-numbered branch in its family, so its only legal target is \`$FINAL_BRANCH\`. Re-point the base branch of this PR."
+          else
+            fail \
+              "'$SRC' must be promoted into '$expected' first, not '$BASE'." \
+              "\`$expected\` sits between \`$SRC\` and \`$BASE\` in the cascade. Merging this PR would carry these changes past \`$expected\`, and because nothing merges back into it, the change would be **lost from \`$expected\` permanently**. Re-point this PR's base branch to \`$expected\`; once merged, the promotion workflow opens the next hop automatically."
+          fi
