@@ -1,135 +1,3 @@
-name: Guard Cascade Order
-
-# Blocks pull requests that skip a hop in the release cascade.
-#
-# The promotion workflow OPENS the correct PRs; nothing stops a human from
-# opening a different one by hand. If D21 merges straight into master while
-# D22 exists, that change is carried past D22 — and because nothing merges
-# back into D22, the fix disappears from it permanently.
-#
-#   D21 -> D22       (D22 exists)   -> allowed, this is the next hop
-#   D21 -> master    (D22 exists)   -> BLOCKED, must go through D22
-#   D21 -> D2021     (D22 exists)   -> BLOCKED, skips D22
-#   D2021 -> master  (nothing above) -> allowed, tip of the family
-#   feature/x -> D21                -> ignored, head is not a release branch
-#
-# Failing the check only blocks merging if it is a REQUIRED status check.
-# Without branch protection this is advisory only.
-
-on:
-  pull_request:
-    # 'edited' catches someone changing the base branch after opening.
-    # 'labeled'/'unlabeled' re-evaluate when the override label is added or removed.
-    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
-
-env:
-  # Branch the tip of a family is allowed to target.
-  FINAL_BRANCH: master
-  # PR label that bypasses this guard, for genuine emergencies.
-  # Set to an empty string to remove the escape hatch entirely.
-  OVERRIDE_LABEL: cascade-override
-
-jobs:
-  guard:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check the PR targets the next branch in the cascade
-        env:
-          SRC: ${{ github.event.pull_request.head.ref }}
-          BASE: ${{ github.event.pull_request.base.ref }}
-          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # --- KEEP IN SYNC with the identical parse() in the promotion workflow ---
-          # Splits "<front-ending-in-non-digit><trailing-number>" and strips the
-          # 3-part version so branches differing only by version share a family.
-          parse() {  # $1 = branch name; sets PARSE_STEM and PARSE_NUM, returns 1 if not a release branch
-            local b="$1" front
-            [[ "$b" =~ ^(.*[^0-9])([0-9]+)$ ]] || return 1
-            front="${BASH_REMATCH[1]}"
-            PARSE_NUM=$(( 10#${BASH_REMATCH[2]} ))
-            [[ "$front" =~ ^(release_)[0-9]+\.[0-9]+\.[0-9]+(.*)$ ]] || return 1
-            PARSE_STEM="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
-            return 0
-          }
-
-          fail() {  # $1 = one-line reason, $2 = guidance paragraph
-            echo "::error title=Cascade order violation::$1"
-            {
-              echo "### ❌ Cascade order violation"
-              echo
-              echo "**\`$SRC\` → \`$BASE\` is not allowed.**"
-              echo
-              echo "$2"
-              echo
-              if [[ -n "$OVERRIDE_LABEL" ]]; then
-                echo "If this is a genuine emergency, add the \`$OVERRIDE_LABEL\` label to bypass this check."
-              fi
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          }
-
-          if [[ -n "$OVERRIDE_LABEL" ]] && jq -e --arg l "$OVERRIDE_LABEL" 'any(.[]; . == $l)' <<<"$LABELS" >/dev/null; then
-            echo "PR carries the '$OVERRIDE_LABEL' label — guard bypassed."
-            exit 0
-          fi
-
-          if ! parse "$SRC"; then
-            echo "Head branch '$SRC' is not a numbered release branch — guard does not apply."
-            exit 0
-          fi
-          src_stem="$PARSE_STEM"
-          src_num="$PARSE_NUM"
-          echo "Head '$SRC' -> family '$src_stem', number $src_num. The only legal target is the next-higher-numbered branch in this family, else '$FINAL_BRANCH'."
-
-          # The next branch is the LOWEST number strictly greater than ours in the
-          # same family. Do not assume current+1 — the counter has gaps (a family
-          # can hold both D21 and D2021), and assuming density makes an older
-          # branch look like the tip and lets it merge straight to master.
-          expected=""
-          expected_num=-1
-          while read -r _sha ref; do
-            b="${ref#refs/heads/}"
-            if parse "$b" && [[ "$PARSE_STEM" == "$src_stem" && "$PARSE_NUM" -gt "$src_num" ]]; then
-              if [[ -z "$expected" || "$PARSE_NUM" -lt "$expected_num" ]]; then
-                expected="$b"
-                expected_num="$PARSE_NUM"
-              fi
-            fi
-          done < <(git ls-remote --heads origin 'release_*')
-
-          if [[ -z "$expected" ]]; then
-            expected="$FINAL_BRANCH"
-            echo "No higher-numbered branch in family '$src_stem' — '$SRC' is the tip, so '$FINAL_BRANCH' is the legal target."
-          else
-            echo "Next branch in the cascade is '$expected'."
-          fi
-
-          if [[ "$BASE" == "$expected" ]]; then
-            echo "OK: '$SRC' -> '$BASE' is the correct next hop in the cascade."
-            exit 0
-          fi
-
-          if [[ "$expected" == "$FINAL_BRANCH" ]]; then
-            fail \
-              "'$SRC' must target '$FINAL_BRANCH', not '$BASE'." \
-              "\`$SRC\` is the highest-numbered branch in its family, so its only legal target is \`$FINAL_BRANCH\`. Re-point the base branch of this PR."
-          else
-            fail \
-              "'$SRC' must be promoted into '$expected' first, not '$BASE'." \
-              "\`$expected\` sits between \`$SRC\` and \`$BASE\` in the cascade. Merging this PR would carry these changes past \`$expected\`, and because nothing merges back into it, the change would be **lost from \`$expected\` permanently**. Re-point this PR's base branch to \`$expected\`; once merged, the promotion workflow opens the next hop automatically."
-          fi
-
----
-File 2 — central repo .github/workflows/promote-reusable.yml
-
 name: Promote Release (Reusable)
 
 
@@ -172,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # --- helper: split "<front-ending-in-non-digit><trailing-number>" ---
+          # --- helper: split "<front-ending-in-non-digit><tra
           # POSIX ERE (used by bash =~) has no non-greedy match, so we anchor the
           # trailing digits with [0-9]+$ and force the front to end in a non-digit.
           parse() {  # $1 = branch name; sets PARSE_STEM and PARSE_NUM, returns 1 if not a release branch
@@ -181,7 +49,7 @@ jobs:
             front="${BASH_REMATCH[1]}"
             PARSE_NUM=$(( 10#${BASH_REMATCH[2]} ))
             # Drop the 3-part version so branches differing only by version share a family.
-            [[ "$front" =~ ^(release_)[0-9]+\.[0-9]+\.[0-9]+(.*)$ ]] || return 1
+            [[ "$front" =~ ^(release_)[0-9]+\.[0-9]+\.[0-9]+(.
             PARSE_STEM="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
             return 0
           }
@@ -196,7 +64,7 @@ jobs:
           echo "Source '$SRC' -> family '$src_stem', number $src_num, looking for the next higher number in this family."
 
           # The next branch is the LOWEST number strictly greater than ours in the
-          # same family. Do not assume current+1 — the counter has gaps (a family
+          # same family. Do not assume current+1 — the counter
           # can hold both D21 and D2021).
           # KEEP IN SYNC with the guard workflow: if these two disagree, the
           # cascade opens PRs the guard refuses to let anyone merge.
@@ -205,7 +73,7 @@ jobs:
           while read -r _sha ref; do
             b="${ref#refs/heads/}"
             if parse "$b" && [[ "$PARSE_STEM" == "$src_stem" && "$PARSE_NUM" -gt "$src_num" ]]; then
-              if [[ -z "$dest" || "$PARSE_NUM" -lt "$dest_num" ]]; then
+              if [[ -z "$dest" || "$PARSE_NUM" -lt "$dest_num"
                 dest="$b"
                 dest_num="$PARSE_NUM"
               fi
@@ -231,7 +99,7 @@ jobs:
       - name: Open promotion PR
         if: steps.next.outputs.skip != 'true'
         env:
-          # Prefer the supplied PAT/App token; fall back to GITHUB_TOKEN for repos
+          # Prefer the supplied PAT/App token; fall back to GI
           # whose org still permits Actions to create pull requests.
           GH_TOKEN: ${{ secrets.GHA_PR || secrets.GITHUB_TOKEN }}
           HAVE_PAT: ${{ secrets.GHA_PR != '' }}
@@ -247,20 +115,20 @@ jobs:
           if [[ "$HAVE_PAT" == "true" ]]; then
             echo "Using GHA_PR token to open the PR."
           else
-            echo "GHA_PR not provided — falling back to GITHUB_TOKEN. This fails if the org"
+            echo "GHA_PR not provided — falling back to GITHUB"
             echo "disallows 'Allow GitHub Actions to create and approve pull requests'."
           fi
 
           # Nothing to promote if the destination already contains every commit from source.
           if [[ -z "$(git rev-list "origin/$DEST..origin/$SRC" 2>/dev/null || echo HAS_DIFF)" ]]; then
-            echo "'$DEST' already contains everything in '$SRC'. Nothing to promote."
+            echo "'$DEST' already contains everything in '$SRC
             exit 0
           fi
 
           # Idempotent: if the PR for this exact hop is already open, leave it.
           existing=$(gh pr list --state open --head "$SRC" --base "$DEST" --json number --jq '.[0].number' || true)
           if [[ -n "${existing:-}" ]]; then
-            echo "PR #$existing already open for $SRC -> $DEST. Nothing to do."
+            echo "PR #$existing already open for $SRC -> $DEST
             exit 0
           fi
 
