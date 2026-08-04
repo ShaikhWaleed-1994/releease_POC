@@ -1,36 +1,149 @@
-# This is a basic workflow to help you get started with Actions
+name: Guard Cascade Order
 
-name: CI
+# Blocks a pull request that skips a hop in the release cascade.
+#
+# A hop only matters if the intermediate branch would actually MISS the change.
+# Branches that already contain every commit from the head branch are skipped,
+# so a redundant hop never blocks a PR.
+#
+#   D21 -> master    (D22 exists, lacks D21's commits)   BLOCKED, go via D22
+#   D21 -> master    (D22 already contains D21)          allowed, hop redundant
+#   D21 -> D22       (D22 lacks D21's commits)           allowed, correct hop
+#   D2021 -> master  (nothing higher)                    allowed, tip of family
+#   feature/x -> D21                                     ignored, not a release branch
+#
+# This only PREVENTS a merge when it is a required status check. Add it under
+# Settings > Branches for master and release_* once it has run one time.
 
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "master" branch
-  push:
-    branches: [ "master" ]
   pull_request:
-    branches: [ "master" ]
+    # 'edited' catches a base-branch change after the PR is opened.
+    # 'labeled'/'unlabeled' re-evaluate when the override label changes.
+    types: [opened, reopened, synchronize, edited, labeled, unlabeled]
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+env:
+  # Branch the tip of a family is allowed to target.
+  FINAL_BRANCH: master
+  # PR label that bypasses this guard. Set to "" to remove the escape hatch.
+  OVERRIDE_LABEL: cascade-override
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  guard:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      # fetch-depth: 0 is required - the containment check below needs history.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
-
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Fetch all release branches
+        shell: bash
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -euo pipefail
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/*:refs/remotes/origin/*"
+
+      - name: Check the PR targets the next branch in the cascade
+        env:
+          SRC: ${{ github.event.pull_request.head.ref }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Split "<front ending in non-digit><trailing number>", then drop the
+          # 3-part version so branches differing only by version share a family.
+          # KEEP IN SYNC with promote-reusable.yml
+          parse() {
+            local b="$1" front
+            [[ "$b" =~ ^(.*[^0-9])([0-9]+)$ ]] || return 1
+            front="${BASH_REMATCH[1]}"
+            PARSE_NUM=$(( 10#${BASH_REMATCH[2]} ))
+            [[ "$front" =~ ^(release_)[0-9]+\.[0-9]+\.[0-9]+(.*)$ ]] || return 1
+            PARSE_STEM="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+            return 0
+          }
+
+          # True when $1 already contains every commit reachable from $SRC.
+          # Such a hop is redundant: merging past it loses nothing.
+          contains_src() {
+            git merge-base --is-ancestor \
+              "origin/$SRC" "origin/$1" 2>/dev/null
+          }
+
+          if [[ -n "$OVERRIDE_LABEL" ]]; then
+            if jq -e --arg l "$OVERRIDE_LABEL" 'any(.[]; . == $l)' \
+                 <<<"$LABELS" >/dev/null; then
+              echo "Label '$OVERRIDE_LABEL' present - guard bypassed."
+              exit 0
+            fi
+          fi
+
+          if ! parse "$SRC"; then
+            echo "Head '$SRC' is not a release branch - guard does not apply."
+            exit 0
+          fi
+          src_stem="$PARSE_STEM"
+          src_num="$PARSE_NUM"
+          echo "Head '$SRC': family '$src_stem', number $src_num."
+
+          # Collect every branch in this family numbered above ours, ascending.
+          # Do not assume current+1; the counter has gaps (D21 and D2021 coexist).
+          candidates=$(
+            while read -r _sha ref; do
+              b="${ref#refs/heads/}"
+              parse "$b" || continue
+              [[ "$PARSE_STEM" == "$src_stem" ]] || continue
+              [[ "$PARSE_NUM" -gt "$src_num" ]] || continue
+              echo "$PARSE_NUM $b"
+            done < <(git ls-remote --heads origin 'release_*') | sort -n
+          )
+
+          # The required target is the first branch above us that does NOT yet
+          # have our commits. Anything already containing them is skipped.
+          required=""
+          while read -r _num b; do
+            [[ -n "$b" ]] || continue
+            if contains_src "$b"; then
+              echo "Skipping '$b' - it already contains '$SRC'."
+              continue
+            fi
+            required="$b"
+            break
+          done <<<"$candidates"
+
+          if [[ -z "$required" ]]; then
+            required="$FINAL_BRANCH"
+            echo "No branch above us is missing these commits."
+          fi
+          echo "Legal target is '$required'."
+
+          if [[ "$BASE" == "$required" ]]; then
+            echo "OK: '$SRC' -> '$BASE' is the correct next hop."
+            exit 0
+          fi
+
+          echo "::error::'$SRC' must target '$required', not '$BASE'."
+          {
+            echo "### Cascade order violation"
+            echo
+            echo "\`$SRC\` -> \`$BASE\` is not allowed."
+            echo
+            echo "The only legal target is \`$required\`, which does not yet"
+            echo "contain the commits on \`$SRC\`."
+            echo
+            echo "Merging past it would carry these changes beyond it, and"
+            echo "nothing ever merges back, so the change would be lost"
+            echo "from \`$required\` permanently."
+            echo
+            echo "Re-point this PR's base branch to \`$required\`."
+            if [[ -n "$OVERRIDE_LABEL" ]]; then
+              echo
+              echo "Emergency bypass: add the \`$OVERRIDE_LABEL\` label."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
