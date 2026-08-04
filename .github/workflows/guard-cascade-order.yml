@@ -2,11 +2,15 @@ name: Guard Cascade Order
 
 # Blocks a pull request that skips a hop in the release cascade.
 #
-#   D21 -> D22       (D22 exists)       allowed, correct next hop
-#   D21 -> master    (D22 exists)       BLOCKED
-#   D21 -> D2021     (D22 exists)       BLOCKED, skips D22
-#   D2021 -> master  (nothing higher)   allowed, tip of the family
-#   feature/x -> D21                    ignored, head is not a release branch
+# A hop only matters if the intermediate branch would actually MISS the change.
+# Branches that already contain every commit from the head branch are skipped,
+# so a redundant hop never blocks a PR.
+#
+#   D21 -> master    (D22 exists, lacks D21's commits)   BLOCKED, go via D22
+#   D21 -> master    (D22 already contains D21)          allowed, hop redundant
+#   D21 -> D22       (D22 lacks D21's commits)           allowed, correct hop
+#   D2021 -> master  (nothing higher)                    allowed, tip of family
+#   feature/x -> D21                                     ignored, not a release branch
 #
 # This only PREVENTS a merge when it is a required status check. Add it under
 # Settings > Branches for master and release_* once it has run one time.
@@ -30,7 +34,17 @@ jobs:
       contents: read
 
     steps:
+      # fetch-depth: 0 is required - the containment check below needs history.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all release branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin \
+            "+refs/heads/*:refs/remotes/origin/*"
 
       - name: Check the PR targets the next branch in the cascade
         env:
@@ -54,6 +68,13 @@ jobs:
             return 0
           }
 
+          # True when $1 already contains every commit reachable from $SRC.
+          # Such a hop is redundant: merging past it loses nothing.
+          contains_src() {
+            git merge-base --is-ancestor \
+              "origin/$SRC" "origin/$1" 2>/dev/null
+          }
+
           if [[ -n "$OVERRIDE_LABEL" ]]; then
             if jq -e --arg l "$OVERRIDE_LABEL" 'any(.[]; . == $l)' \
                  <<<"$LABELS" >/dev/null; then
@@ -70,46 +91,56 @@ jobs:
           src_num="$PARSE_NUM"
           echo "Head '$SRC': family '$src_stem', number $src_num."
 
-          # Next branch = lowest number strictly greater than ours in the family.
+          # Collect every branch in this family numbered above ours, ascending.
           # Do not assume current+1; the counter has gaps (D21 and D2021 coexist).
-          expected=""
-          expected_num=-1
-          while read -r _sha ref; do
-            b="${ref#refs/heads/}"
-            parse "$b" || continue
-            [[ "$PARSE_STEM" == "$src_stem" ]] || continue
-            [[ "$PARSE_NUM" -gt "$src_num" ]] || continue
-            if [[ -z "$expected" || "$PARSE_NUM" -lt "$expected_num" ]]; then
-              expected="$b"
-              expected_num="$PARSE_NUM"
+          candidates=$(
+            while read -r _sha ref; do
+              b="${ref#refs/heads/}"
+              parse "$b" || continue
+              [[ "$PARSE_STEM" == "$src_stem" ]] || continue
+              [[ "$PARSE_NUM" -gt "$src_num" ]] || continue
+              echo "$PARSE_NUM $b"
+            done < <(git ls-remote --heads origin 'release_*') | sort -n
+          )
+
+          # The required target is the first branch above us that does NOT yet
+          # have our commits. Anything already containing them is skipped.
+          required=""
+          while read -r _num b; do
+            [[ -n "$b" ]] || continue
+            if contains_src "$b"; then
+              echo "Skipping '$b' - it already contains '$SRC'."
+              continue
             fi
-          done < <(git ls-remote --heads origin 'release_*')
+            required="$b"
+            break
+          done <<<"$candidates"
 
-          if [[ -z "$expected" ]]; then
-            expected="$FINAL_BRANCH"
-            echo "Nothing higher in family - legal target is '$FINAL_BRANCH'."
-          else
-            echo "Next branch in the cascade is '$expected'."
+          if [[ -z "$required" ]]; then
+            required="$FINAL_BRANCH"
+            echo "No branch above us is missing these commits."
           fi
+          echo "Legal target is '$required'."
 
-          if [[ "$BASE" == "$expected" ]]; then
+          if [[ "$BASE" == "$required" ]]; then
             echo "OK: '$SRC' -> '$BASE' is the correct next hop."
             exit 0
           fi
 
-          echo "::error::'$SRC' must target '$expected', not '$BASE'."
+          echo "::error::'$SRC' must target '$required', not '$BASE'."
           {
             echo "### Cascade order violation"
             echo
             echo "\`$SRC\` -> \`$BASE\` is not allowed."
             echo
-            echo "The only legal target is \`$expected\`."
+            echo "The only legal target is \`$required\`, which does not yet"
+            echo "contain the commits on \`$SRC\`."
             echo
-            echo "Merging past \`$expected\` would carry these changes"
-            echo "beyond it. Nothing ever merges back into it, so the"
-            echo "change would be lost from \`$expected\` permanently."
+            echo "Merging past it would carry these changes beyond it, and"
+            echo "nothing ever merges back, so the change would be lost"
+            echo "from \`$required\` permanently."
             echo
-            echo "Re-point this PR's base branch to \`$expected\`."
+            echo "Re-point this PR's base branch to \`$required\`."
             if [[ -n "$OVERRIDE_LABEL" ]]; then
               echo
               echo "Emergency bypass: add the \`$OVERRIDE_LABEL\` label."
